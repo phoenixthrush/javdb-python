@@ -1,11 +1,12 @@
 # javdb-python
 
-Python API wrapper for javdatabase.com. Search movies, extract metadata, and download preview images.
+Command-line scraper for javdatabase.com. Search movies, extract metadata, and
+download preview images or NFO files for media centers.
 
 ## Installation
 
 ```bash
-pip install .
+pip install javdb
 ```
 
 ## Usage
@@ -16,6 +17,9 @@ Search for a movie by ID or title and interactively select from results:
 
 ```bash
 javdb
+```
+
+```bash
 javdb --query SONE-763
 ```
 
@@ -83,6 +87,22 @@ When `--json` is used, the same metadata is returned as a JSON object with
 keys such as `title`, `jav_series`, `dvd_id`, `content_id`, `release_date`,
 `runtime`, `studio`, `director`, `genres`, `actresses`, `preview_images`,
 and `poster`.
+
+## Programmatic Use (experimental)
+
+You can also call the scraping helpers from Python code:
+
+```python
+from javdb.__main__ import fetch_movie_metadata, fetch_preview_images, fetch_poster_url
+
+url = "https://www.javdatabase.com/movies/sone-763/"
+meta = fetch_movie_metadata(url)
+previews = fetch_preview_images(url)
+poster = fetch_poster_url(url)
+```
+
+The functions and HTML structure are not considered a stable API, but this can
+be handy for quick scripts.
 
 ## License
 

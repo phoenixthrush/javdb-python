@@ -1,6 +1,6 @@
 [project]
 name = "javdb"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
   "niquests",
 ]
@@ -11,7 +11,7 @@ authors = [
 maintainers = [
   { name="Phoenixthrush UwU", email="contact@phoenixthrush.com" }
 ]
-description = "Python API wrapper for javdatabase.com. Search movies, extract metadata, and download preview images."
+description = "Command-line scraper for javdatabase.com. Search movies, extract metadata, and download preview images or NFO files for media centers."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
