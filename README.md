@@ -5,7 +5,7 @@ Python API wrapper for javdatabase.com. Search movies, extract metadata, and dow
 ## Installation
 
 ```bash
-pip install requests beautifulsoup4
+pip install .
 ```
 
 ## Usage
@@ -15,24 +15,24 @@ pip install requests beautifulsoup4
 Search for a movie by ID or title and interactively select from results:
 
 ```bash
-python ./main.py 
-python ./main.py --query SONE-763
+javdb
+javdb --query SONE-763
 ```
 
-### Search with Download
+### Search with NFO Output
 
-Search and download preview images to `dvd_id/preview/`:
+Search and save metadata to a Kodi-compatible NFO file:
 
 ```bash
-python ./main.py --query SONE-763 --download
+javdb --query SONE-763 --output SONE-763.nfo
 ```
 
 ### Search with JSON Output
 
-Search and save metadata to a file:
+Search and save metadata as JSON:
 
 ```bash
-python ./main.py --query SONE-763 --output metadata.json
+javdb --query SONE-763 --json --output metadata.json
 ```
 
 ### Direct Link
@@ -40,7 +40,7 @@ python ./main.py --query SONE-763 --output metadata.json
 Skip the search and go directly to a movie page:
 
 ```bash
-python ./main.py --link https://www.javdatabase.com/movies/sone-763/
+javdb --link https://www.javdatabase.com/movies/sone-763/
 ```
 
 ### Direct Link with Download
@@ -48,7 +48,7 @@ python ./main.py --link https://www.javdatabase.com/movies/sone-763/
 Download preview images directly from a movie URL:
 
 ```bash
-python ./main.py --link https://www.javdatabase.com/movies/sone-763/ --download
+javdb --link https://www.javdatabase.com/movies/sone-763/ --download
 ```
 
 ### All Options Combined
@@ -56,77 +56,33 @@ python ./main.py --link https://www.javdatabase.com/movies/sone-763/ --download
 Search, save metadata, and download images:
 
 ```bash
-python ./main.py --query SONE-763 --output metadata.json --download
+javdb --query SONE-763 --output SONE-763.nfo --download
 ```
 
 ## Options
 
 - `--query, -q`: Search query (e.g., video ID or title)
 - `--link, -l`: Direct URL to movie page (skips search)
-- `--output, -o`: Output file path (saves metadata as JSON)
-- `--download, -d`: Download preview images to `dvd_id/preview/`
-
-## Output
-
-When you search for a movie, metadata is extracted and displayed as JSON:
-
-```json
-{
-    "link": "https://www.javdatabase.com/movies/sone-763/",
-    "title": "SONE-763 -  A quiet and intelligent beauty is trained to be a real dick - Ayaka Kawakita",
-    "jav_series": null,
-    "dvd_id": "SONE-763",
-    "content_id": "sone00763",
-    "release_date": "2025-06-20",
-    "runtime": "160 min.",
-    "studio": "S1 NO.1 STYLE",
-    "director": "Hironori Takase",
-    "genres": [
-        "4K",
-        "Cowgirl",
-        "Dirty Talk",
-        "Drama",
-        "Exclusive Distribution",
-        "Featured Actress",
-        "Hi-Def",
-        "Slut",
-        "Various Worker"
-    ],
-    "actresses": [
-        "Saika Kawakita"
-    ],
-    "preview_images": [
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-1.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-2.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-3.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-4.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-5.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-6.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-7.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-8.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-9.jpg",
-        "https://pics.dmm.co.jp/digital/video/sone00763/sone00763jp-10.jpg"
-    ]
-}
-```
-
-When `--download` is used, a JSON copy is automatically saved to `dvd_id/content_id.json`.
+- `--output, -o`: Output file path (NFO/XML by default, or JSON when `--json` is used)
+- `--download, -d`: Download poster and preview images to `dvd_id/preview/` and write NFO there
+- `--json`: Output metadata as JSON instead of NFO/XML
 
 ## Extracted Metadata
 
-The tool extracts the following information:
+The tool scrapes javdatabase.com and writes a Kodi-style `movie.nfo` XML with:
 
-- **Title**: Full movie title
-- **JAV Series**: Series name (if applicable)
-- **DVD ID**: Product ID (e.g., SONE-763)
-- **Content ID**: Content identifier (e.g., sone00763)
-- **Release Date**: Release date
-- **Runtime**: Duration in minutes
-- **Studio**: Production studio
-- **Director**: Director (if available)
-- **Genres**: List of genre tags
-- **Actresses**: List of actresses/idols
-- **Preview Images**: URLs to preview images for download
+- **Title**
+- **Series** (when available)
+- **DVD ID** and **Content ID**
+- **Release Date** and **Runtime**
+- **Studio** and **Director**
+- **Genres** and **Actresses/Idols**
+- Optional poster and fanart references when `--download` is used
+
+When `--json` is used, the same metadata is returned as a JSON object with
+keys such as `title`, `jav_series`, `dvd_id`, `content_id`, `release_date`,
+`runtime`, `studio`, `director`, `genres`, `actresses`, `preview_images`,
+and `poster`.
 
 ## License
 

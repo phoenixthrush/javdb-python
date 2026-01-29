@@ -1,0 +1,35 @@
+[project]
+name = "javdb"
+version = "0.0.1"
+dependencies = [
+  "niquests",
+]
+requires-python = ">=3.7"
+authors = [
+  { name="Phoenixthrush UwU", email="contact@phoenixthrush.com" },
+]
+maintainers = [
+  { name="Phoenixthrush UwU", email="contact@phoenixthrush.com" }
+]
+description = "Python API wrapper for javdatabase.com. Search movies, extract metadata, and download preview images."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["javdatabase", "movies", "metadata", "preview", "images"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python"
+]
+
+[project.urls]
+Homepage = "https://github.com/phoenixthrush/javdb-python"
+Documentation = "https://github.com/phoenixthrush/javdb-python/blob/main/README.md"
+Repository = "https://github.com/phoenixthrush/javdb-python.git"
+"Bug Tracker" = "https://github.com/phoenixthrush/javdb-python/issues"
+Changelog = "https://github.com/phoenixthrush/javdb-python/commits"
+"Source Code" = "https://github.com/phoenixthrush/javdb-python"
+"Download" = "https://github.com/phoenixthrush/javdb-python/archive/refs/heads/main.zip"
+Funding = "https://github.com/sponsors/phoenixthrush"
+
+[project.scripts]
+javdb = "javdb.__main__:main"
