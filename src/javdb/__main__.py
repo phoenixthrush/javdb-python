@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from html import unescape
 from urllib.parse import unquote, urlparse
 
@@ -53,7 +54,9 @@ def _labeled_single(html: str, label: str):
     # If there is another bold label in the same block, cut before it to avoid
     # swallowing following fields (e.g. Genre(s) ending up as Director).
     block = re.split(r"<b[^>]*>.*?</b>", block, 1)[0]
-    return _clean_html_text(block)
+    block = re.sub(r"(?is)<br\s*/?>", "\n", block)
+    first_line = next((ln for ln in block.splitlines() if ln.strip()), "")
+    return _clean_html_text(first_line)
 
 
 def fetch_search(query):
@@ -254,9 +257,12 @@ def fetch_movie_metadata(page_url):
         ["Runtime"], max_words=8
     )
     meta["Studio"] = _labeled_single(html, "Studio") or extract(["Studio"], max_words=8)
-    meta["Director"] = _labeled_single(html, "Director") or extract(
-        ["Director"], max_words=8
-    )
+    director = _labeled_single(html, "Director")
+    if director is None:
+        director = extract(["Director"], max_words=8)
+    elif not director:
+        director = None
+    meta["Director"] = director
     meta["Series"] = _labeled_single(html, "Series") or extract(["Series"], max_words=8)
 
     genres = set(_labeled_links(html, "Genre"))
@@ -342,8 +348,11 @@ def main():
     if metadata.get("Genre(s)"):
         for g in re.split(r"[,|/;]+", metadata["Genre(s)"]):
             g = g.strip()
-            if g:
-                genres_list.append(g)
+            if not g:
+                continue
+            if re.fullmatch(r"genres?|genre\(s\)?", g, flags=re.I):
+                continue
+            genres_list.append(g)
 
     actresses_list = []
     if metadata.get("Idol(s)/Actress(es)"):
@@ -363,8 +372,8 @@ def main():
         "runtime": metadata.get("Runtime"),
         "studio": metadata.get("Studio"),
         "director": metadata.get("Director"),
-        "genres": genres_list or None,
-        "actresses": actresses_list or None,
+        "genres": genres_list,
+        "actresses": actresses_list,
         "preview_images": [
             img.get("full") or img.get("preview")
             for img in previews
@@ -390,9 +399,9 @@ def main():
             try:
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write(json_str)
-                print("JSON written ->", output_path)
+                print("JSON written ->", output_path, file=sys.stderr)
             except Exception as e:
-                print("Failed saving JSON:", e)
+                print("Failed saving JSON:", e, file=sys.stderr)
 
         return
 
