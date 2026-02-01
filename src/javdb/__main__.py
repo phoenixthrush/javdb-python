@@ -27,6 +27,33 @@ def _html_to_text(html: str) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
+def _extract_about(html: str):
+    heading = re.search(
+        r"(?is)<h[1-6][^>]*>[^<]*About[^<]*JAV Movie[^<]*</h[1-6]>",
+        html,
+    )
+    if heading:
+        tail = html[heading.end() :]
+        block = re.split(r"(?is)<h[1-6][^>]*>", tail, maxsplit=1)[0]
+    else:
+        m = re.search(r"(?is)About[^<]*JAV Movie(.*)", html)
+        if not m:
+            return None
+        block = m.group(1)
+        block = re.split(r"(?is)<h[1-6][^>]*>", block, maxsplit=1)[0]
+
+    text = _html_to_text(block)
+    text = re.sub(r"\(No Ratings Yet\).*", "", text)
+    text = re.sub(r"No Ratings Yet.*", "", text)
+    text = re.sub(r"Loading\.{0,3}.*", "", text)
+    text = re.sub(
+        r"JAV Database only provides official, legitimate & legal links.*", "", text
+    )
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    text = "\n".join(lines).strip()
+    return text or None
+
+
 def _labeled_links(html: str, label: str):
     pattern = re.compile(
         rf"(?is)<(?:p|div|li)[^>]*>[^<]*<b[^>]*>[^<]*{re.escape(label)}[^<]*</b>(.*?)</(?:p|div|li)>"
@@ -53,7 +80,7 @@ def _labeled_single(html: str, label: str):
     block = m.group(1)
     # If there is another bold label in the same block, cut before it to avoid
     # swallowing following fields (e.g. Genre(s) ending up as Director).
-    block = re.split(r"<b[^>]*>.*?</b>", block, 1)[0]
+    block = re.split(r"<b[^>]*>.*?</b>", block, maxsplit=1)[0]
     block = re.sub(r"(?is)<br\s*/?>", "\n", block)
     first_line = next((ln for ln in block.splitlines() if ln.strip()), "")
     return _clean_html_text(first_line)
@@ -134,6 +161,38 @@ def safe_filename(name: str) -> str:
     name = re.sub(r"[\\/:*?\"<>|]+", "-", name)
     name = re.sub(r"\s+", "_", name)
     return name[:200]
+
+
+def _select_nfo_basename(folder: str, *, dvd_id: str | None = None) -> str | None:
+    try:
+        entries = [
+            f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))
+        ]
+    except FileNotFoundError:
+        return None
+
+    entries = [f for f in entries if not f.startswith(".")]
+    if not entries:
+        return None
+
+    video_exts = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".webm"}
+    entries_sorted = sorted(entries, key=str.casefold)
+
+    candidates = entries_sorted
+    if dvd_id:
+        dvd_lower = dvd_id.lower()
+        matches = [f for f in entries_sorted if dvd_lower in f.lower()]
+        if matches:
+            candidates = matches
+
+    video_matches = [
+        f for f in candidates if os.path.splitext(f)[1].lower() in video_exts
+    ]
+    if video_matches:
+        return os.path.splitext(video_matches[0])[0]
+    if dvd_id:
+        return None
+    return os.path.splitext(candidates[0])[0]
 
 
 def fetch_preview_images(page_url):
@@ -264,6 +323,8 @@ def fetch_movie_metadata(page_url):
         director = None
     meta["Director"] = director
     meta["Series"] = _labeled_single(html, "Series") or extract(["Series"], max_words=8)
+
+    meta["Plot"] = _extract_about(html)
 
     genres = set(_labeled_links(html, "Genre"))
     meta["Genre(s)"] = ", ".join(sorted(genres)) if genres else None
@@ -406,8 +467,8 @@ def main():
         return
 
     # Prepare XML (NFO)
-    from xml.etree.ElementTree import Element, SubElement, tostring
     import xml.dom.minidom as md
+    from xml.etree.ElementTree import Element, SubElement, tostring
 
     def tag(parent, name, val):
         if val:
@@ -436,7 +497,8 @@ def main():
         runtime = m.group(1) if m else None
     tag(movie, "runtime", runtime)
 
-    tag(movie, "plot", "")
+    plot = metadata.get("Plot")
+    tag(movie, "plot", plot)
     tag(movie, "review", "")
     tag(movie, "biography", "")
 
@@ -479,8 +541,18 @@ def main():
 
     if args.download:
         folder_name = metadata.get("DVD ID") or title or "movie"
-        folder = safe_filename(folder_name)
-        os.makedirs(folder, exist_ok=True)
+        dvd_id = metadata.get("DVD ID")
+        cwd = os.getcwd()
+        base_in_cwd = _select_nfo_basename(cwd, dvd_id=dvd_id)
+        if base_in_cwd:
+            folder = cwd
+            default_base = base_in_cwd
+        else:
+            folder = safe_filename(folder_name)
+            os.makedirs(folder, exist_ok=True)
+            default_base = _select_nfo_basename(folder, dvd_id=dvd_id) or safe_filename(
+                folder_name
+            )
 
         preview_folder = os.path.join(folder, "preview")
         os.makedirs(preview_folder, exist_ok=True)
@@ -526,14 +598,13 @@ def main():
                 print("Preview download failed:", e)
 
         # If --download is enabled, ALWAYS write NFO inside movie folder by default
-        output_path = output_path or os.path.join(
-            folder, f"{os.listdir(folder)[0].rsplit('.', 1)[0]}.nfo"
-        )
+        if not output_path:
+            output_path = os.path.join(folder, f"{default_base}.nfo")
 
     # ----------------------------------------------------------------------
     # Artwork references in NFO (using relative paths)
     # ----------------------------------------------------------------------
-    if poster_filename:
+    if postersrc:
         tag(movie, "thumb", postersrc)
 
     if local_fanarts:
@@ -554,7 +625,8 @@ def main():
     print(xml_str)
 
     # Save NFO (if output path defined or forced by download)
-    if output_path := (output_path or args.output):
+    output_path = output_path or args.output
+    if output_path:
         try:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(xml_str)
