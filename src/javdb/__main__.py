@@ -1,429 +1,404 @@
 import argparse
 import json
-import os
 import re
 import sys
 from html import unescape
+from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlparse
+from xml.dom import minidom
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 import niquests
-from niquests.utils import requote_uri
+
+REQUEST_TIMEOUT = 15
+DOWNLOAD_TIMEOUT = 20
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".webm"}
 
 
 def _clean_html_text(fragment: str) -> str:
+    """Turn a small HTML fragment into one clean line."""
     text = re.sub(r"<[^>]+>", " ", fragment)
-    text = unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
 def _html_to_text(html: str) -> str:
-    # Rough HTML -> plain text conversion with block separators
-    html = re.sub(r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>", "\n", html, flags=re.I)
-    html = re.sub(r"<[^>]+>", " ", html)
-    html = unescape(html)
+    """Convert HTML to text while keeping useful block boundaries."""
+    html = re.sub(
+        r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>",
+        "\n",
+        html,
+        flags=re.IGNORECASE,
+    )
+    text = unescape(re.sub(r"<[^>]+>", " ", html))
+    lines = (re.sub(r"\s+", " ", line).strip() for line in text.splitlines())
+    return "\n".join(line for line in lines if line)
 
-    # Normalize whitespace while preserving newlines
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in html.splitlines()]
-    return "\n".join(ln for ln in lines if ln)
+
+def _fetch_html(url: str) -> Optional[str]:
+    """Fetch optional movie details without crashing the whole command."""
+    try:
+        response = niquests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.text or ""
+    except Exception as error:
+        print(f"Failed to fetch {url}: {error}", file=sys.stderr)
+        return None
 
 
-def _extract_about(html: str):
+def _extract_about(html: str) -> Optional[str]:
     heading = re.search(
         r"(?is)<h[1-6][^>]*>[^<]*About[^<]*JAV Movie[^<]*</h[1-6]>",
         html,
     )
-    if heading:
-        tail = html[heading.end() :]
-        block = re.split(r"(?is)<h[1-6][^>]*>", tail, maxsplit=1)[0]
-    else:
-        m = re.search(r"(?is)About[^<]*JAV Movie(.*)", html)
-        if not m:
-            return None
-        block = m.group(1)
-        block = re.split(r"(?is)<h[1-6][^>]*>", block, maxsplit=1)[0]
 
-    text = _html_to_text(block)
-    text = re.sub(r"\(No Ratings Yet\).*", "", text)
-    text = re.sub(r"No Ratings Yet.*", "", text)
-    text = re.sub(r"Loading\.{0,3}.*", "", text)
-    text = re.sub(
-        r"JAV Database only provides official, legitimate & legal links.*", "", text
-    )
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    text = "\n".join(lines).strip()
+    if heading:
+        section = html[heading.end() :]
+    else:
+        fallback = re.search(r"(?is)About[^<]*JAV Movie(.*)", html)
+        if not fallback:
+            return None
+        section = fallback.group(1)
+
+    section = re.split(r"(?is)<h[1-6][^>]*>", section, maxsplit=1)[0]
+    text = _html_to_text(section)
+
+    # These are page widgets and notices, not part of the plot.
+    for marker in (
+        r"\(No Ratings Yet\).*",
+        r"No Ratings Yet.*",
+        r"Loading\.{0,3}.*",
+        r"JAV Database only provides official, legitimate & legal links.*",
+    ):
+        text = re.sub(marker, "", text)
+
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     return text or None
 
 
 def _labeled_links(html: str, label: str):
+    """Return link text found after a bold field label."""
     pattern = re.compile(
-        rf"(?is)<(?:p|div|li)[^>]*>[^<]*<b[^>]*>[^<]*{re.escape(label)}[^<]*</b>(.*?)</(?:p|div|li)>"
+        rf"(?is)<(?:p|div|li)[^>]*>[^<]*<b[^>]*>[^<]*"
+        rf"{re.escape(label)}[^<]*</b>(.*?)</(?:p|div|li)>"
     )
-    vals = []
-    for m in pattern.finditer(html):
-        block = m.group(1)
-        for a in re.findall(r"<a[^>]*>(.*?)</a>", block, flags=re.I | re.S):
-            txt = _clean_html_text(a)
-            if txt:
-                vals.append(txt)
-    return vals
+
+    values = []
+    for match in pattern.finditer(html):
+        links = re.findall(r"<a[^>]*>(.*?)</a>", match.group(1), flags=re.I | re.S)
+        for link in links:
+            text = _clean_html_text(link)
+            if text:
+                values.append(text)
+    return values
 
 
-def _labeled_single(html: str, label: str):
-    # Capture the full contents of the container after the label, then clean it.
+def _labeled_single(html: str, label: str) -> Optional[str]:
+    """Return the first value after a bold field label."""
     pattern = re.compile(
-        rf"(?is)<(?:p|div|li)[^>]*>\s*<b[^>]*>[^<]*{re.escape(label)}[^<]*</b>\s*[:\-–]?\s*(.*?)</(?:p|div|li)>"
+        rf"(?is)<(?:p|div|li)[^>]*>\s*<b[^>]*>[^<]*"
+        rf"{re.escape(label)}[^<]*</b>\s*[:\-–]?\s*"
+        rf"(.*?)</(?:p|div|li)>"
     )
-    m = pattern.search(html)
-    if not m:
+    match = pattern.search(html)
+    if not match:
         return None
 
-    block = m.group(1)
-    # If there is another bold label in the same block, cut before it to avoid
-    # swallowing following fields (e.g. Genre(s) ending up as Director).
-    block = re.split(r"<b[^>]*>.*?</b>", block, maxsplit=1)[0]
+    # Stop before another bold label so fields cannot consume each other.
+    block = re.split(r"<b[^>]*>.*?</b>", match.group(1), maxsplit=1)[0]
     block = re.sub(r"(?is)<br\s*/?>", "\n", block)
-    first_line = next((ln for ln in block.splitlines() if ln.strip()), "")
-    return _clean_html_text(first_line)
+    first_line = next((line for line in block.splitlines() if line.strip()), "")
+    return _clean_html_text(first_line) or None
 
 
-def fetch_search(query):
-    """Search javdatabase.com and extract result cards using regex only."""
-    search_url = f"https://www.javdatabase.com/?post_type=movies%2Cuncensored&s={requote_uri(query)}"
-    resp = niquests.get(search_url, timeout=15)
-    resp.raise_for_status()
-    html: str = resp.text or ""
+def _extract_line(page_text: str, labels, max_words: int) -> Optional[str]:
+    """Fallback for fields without the expected HTML wrapper."""
+    for label in labels:
+        pattern = re.compile(
+            rf"{re.escape(label)}\s*[:\-–]?\s*(.*?)\s*(?:\n|$)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(page_text)
+        if match:
+            words = re.sub(r"\s{2,}", " ", match.group(1).strip()).split()
+            return " ".join(words[:max_words])
+    return None
 
-    # Roughly isolate each result card block
+
+def fetch_search(query: str):
+    """Search JAVDatabase and return its visible result cards."""
+    response = niquests.get(
+        "https://www.javdatabase.com/",
+        params={"post_type": "movies,uncensored", "s": query},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    html = response.text or ""
+
     card_pattern = re.compile(
-        r"(?is)<div[^>]+class=\"[^\"]*\bcard\b[^\"]*\bborderlesscard\b[^\"]*\"[^>]*>(.*?)</div>"
+        r'(?is)<div[^>]+class="[^"]*\bcard\b[^"]*\bborderlesscard\b[^"]*"'
+        r"[^>]*>(.*?)</div>"
     )
     results = []
 
-    for m in card_pattern.finditer(html):
-        block = m.group(1)
-
-        code = None
-        link = None
-        # Code + link from p.pcard a / p.display-6.pcard a
-        m_code = re.search(
-            r"(?is)<p[^>]+class=\"[^\"]*\bpcard\b[^\"]*\"[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>",
+    for card in card_pattern.finditer(html):
+        block = card.group(1)
+        code_link = re.search(
+            r'(?is)<p[^>]+class="[^"]*\bpcard\b[^"]*"[^>]*>.*?'
+            r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
             block,
         )
-        if m_code:
-            link = m_code.group(1)
-            code = _clean_html_text(m_code.group(2))
+        if not code_link:
+            continue
 
-        # Title from .mt-auto a, fallback to code text
+        link = code_link.group(1)
+        code = _clean_html_text(code_link.group(2))
+
         title = None
-        m_title_block = re.search(
-            r"(?is)<(?:div|p|span)[^>]+class=\"[^\"]*\bmt-auto\b[^\"]*\"[^>]*>(.*?)</(?:div|p|span)>",
+        title_block = re.search(
+            r'(?is)<(?:div|p|span)[^>]+class="[^"]*\bmt-auto\b[^"]*"'
+            r"[^>]*>(.*?)</(?:div|p|span)>",
             block,
         )
-        if m_title_block:
-            inner = m_title_block.group(1)
-            m_title = re.search(r"(?is)<a[^>]*>(.*?)</a>", inner)
-            if m_title:
-                title = _clean_html_text(m_title.group(1))
-        if not title:
-            title = code
+        if title_block:
+            title_link = re.search(r"(?is)<a[^>]*>(.*?)</a>", title_block.group(1))
+            if title_link:
+                title = _clean_html_text(title_link.group(1))
 
-        # Release date as first YYYY-MM-DD in the card text
         text = _clean_html_text(block)
-        release_date = None
-        m_date = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-        if m_date:
-            release_date = m_date.group(1)
-
-        # Studio from span.btn a / span.btn-primary a
-        studio = None
-        m_stu = re.search(
-            r"(?is)<span[^>]+class=\"[^\"]*\bbtn(?:-primary)?\b[^\"]*\"[^>]*>.*?<a[^>]*>(.*?)</a>",
+        date = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+        studio = re.search(
+            r'(?is)<span[^>]+class="[^"]*\bbtn(?:-primary)?\b[^"]*"'
+            r"[^>]*>.*?<a[^>]*>(.*?)</a>",
             block,
         )
-        if m_stu:
-            studio = _clean_html_text(m_stu.group(1))
 
         results.append(
             {
                 "code": code,
-                "title": title,
+                "title": title or code,
                 "link": link,
-                "date": release_date,
-                "studio": studio,
+                "date": date.group(1) if date else None,
+                "studio": _clean_html_text(studio.group(1)) if studio else None,
             }
         )
 
-    return [r for r in results if r["link"]]
+    return results
 
 
-def safe_filename(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"[\\/:*?\"<>|]+", "-", name)
-    name = re.sub(r"\s+", "_", name)
-    return name[:200]
-
-
-def _select_nfo_basename(folder: str, *, dvd_id: str | None = None) -> str | None:
-    try:
-        entries = [
-            f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))
-        ]
-    except FileNotFoundError:
-        return None
-
-    entries = [f for f in entries if not f.startswith(".")]
-    if not entries:
-        return None
-
-    video_exts = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".flv", ".ts", ".webm"}
-    entries_sorted = sorted(entries, key=str.casefold)
-
-    candidates = entries_sorted
-    if dvd_id:
-        dvd_lower = dvd_id.lower()
-        matches = [f for f in entries_sorted if dvd_lower in f.lower()]
-        if matches:
-            candidates = matches
-
-    video_matches = [
-        f for f in candidates if os.path.splitext(f)[1].lower() in video_exts
-    ]
-    if video_matches:
-        return os.path.splitext(video_matches[0])[0]
-    if dvd_id:
-        return None
-    return os.path.splitext(candidates[0])[0]
-
-
-def fetch_preview_images(page_url):
-    """Fetch preview image URLs from gallery."""
-    try:
-        r = niquests.get(page_url, timeout=15)
-        r.raise_for_status()
-    except Exception:
-        return []
-
-    html: str = r.text or ""
+def parse_preview_images(html: str):
+    """Extract preview and full-size gallery image URLs."""
+    anchors = re.compile(r'(?is)<a([^>]*data-image-src="[^"]+"[^>]*)>(.*?)</a>')
     images = []
 
-    # Match anchors carrying data-image-src / data-image-href
-    anchor_pattern = re.compile(
-        r"(?is)<a([^>]*data-image-src=\"[^\"]+\"[^>]*)>(.*?)</a>"
-    )
+    for attributes, inner_html in anchors.findall(html):
+        preview = re.search(r'data-image-src="([^"]+)"', attributes, flags=re.I)
+        full = re.search(r'data-image-href="([^"]+)"', attributes, flags=re.I)
+        image = re.search(r'<img[^>]+src="([^"]+)"', inner_html, flags=re.I)
 
-    for attrs, inner in anchor_pattern.findall(html):
-        preview = None
-        full = None
-        img_src = None
+        item = {
+            "preview": preview.group(1) if preview else None,
+            "full": full.group(1) if full else None,
+            "img": image.group(1) if image else None,
+        }
+        if item["preview"] or item["full"]:
+            images.append(item)
 
-        m_prev = re.search(r"data-image-src=\"([^\"]+)\"", attrs, flags=re.I)
-        if m_prev:
-            preview = m_prev.group(1)
-
-        m_full = re.search(r"data-image-href=\"([^\"]+)\"", attrs, flags=re.I)
-        if m_full:
-            full = m_full.group(1)
-
-        m_img = re.search(r"<img[^>]+src=\"([^\"]+)\"", inner, flags=re.I)
-        if m_img:
-            img_src = m_img.group(1)
-
-        images.append({"preview": preview, "full": full, "img": img_src})
-
-    return [img for img in images if img["preview"] or img["full"]]
+    return images
 
 
-def fetch_poster_url(page_url):
-    """Extract poster from div#poster-container."""
-    try:
-        r = niquests.get(page_url, timeout=15)
-        r.raise_for_status()
-    except Exception:
-        return None
-
-    html: str = r.text or ""
-
-    # Try div#poster-container first
-    m = re.search(r"(?is)<div[^>]+id=\"poster-container\"[^>]*>(.*?)</div>", html)
-    if m:
-        block = m.group(1)
-        m_img = re.search(r"<img[^>]+src=\"([^\"]+)\"", block, flags=re.I)
-        if m_img:
-            return m_img.group(1)
-
-    # Fallback: .poster img
-    m_img = re.search(
-        r"(?is)<div[^>]+class=\"[^\"]*\bposter\b[^\"]*\"[^>]*>.*?<img[^>]+src=\"([^\"]+)\"",
+def parse_poster_url(html: str) -> Optional[str]:
+    """Extract the best available poster URL."""
+    container = re.search(
+        r'(?is)<div[^>]+id="poster-container"[^>]*>(.*?)</div>',
         html,
     )
-    if m_img:
-        return m_img.group(1)
+    if container:
+        image = re.search(r'<img[^>]+src="([^"]+)"', container.group(1), flags=re.I)
+        if image:
+            return image.group(1)
 
-    # Fallback: img with alt ending in 'JAV Movie Cover'
-    m_img = re.search(
-        r"<img[^>]+alt=\"[^\"]*JAV Movie Cover[^\"]*\"[^>]*src=\"([^\"]+)\"",
-        html,
-        flags=re.I,
-    )
-    if m_img:
-        return m_img.group(1)
-
+    for pattern in (
+        r'(?is)<div[^>]+class="[^"]*\bposter\b[^"]*"[^>]*>.*?'
+        r'<img[^>]+src="([^"]+)"',
+        r'<img[^>]+alt="[^"]*JAV Movie Cover[^"]*"[^>]*src="([^"]+)"',
+    ):
+        image = re.search(pattern, html, flags=re.I)
+        if image:
+            return image.group(1)
     return None
 
 
-def fetch_movie_metadata(page_url):
-    """Scrape title, IDs, dates, genres, actresses, etc."""
-    try:
-        r = niquests.get(page_url, timeout=15)
-        r.raise_for_status()
-    except Exception:
-        return {}
-
-    html: str = r.text or ""
-    meta = {}
-
-    # Title from first h1
-    m_title = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html)
-    meta["Title"] = _clean_html_text(m_title.group(1)) if m_title else None
-
+def parse_movie_metadata(html: str):
+    """Extract Kodi-friendly metadata from one movie page."""
+    title = re.search(r"(?is)<h1[^>]*>(.*?)</h1>", html)
     page_text = _html_to_text(html)
 
-    def extract(patterns, *, max_words: int | None = None):
-        for pat in patterns:
-            regex = re.compile(rf"{pat}\s*[:\-–]?\s*(.*?)\s*(?:\n|$)", re.I)
-            m = regex.search(page_text)
-            if m:
-                value = m.group(1).strip()
-                value = re.sub(r"\s{2,}", " ", value)
-                if max_words is not None:
-                    words = value.split()
-                    if len(words) > max_words:
-                        value = " ".join(words[:max_words])
-                return value
+    def field(label: str, fallbacks, max_words: int) -> Optional[str]:
+        return _labeled_single(html, label) or _extract_line(
+            page_text, fallbacks, max_words
+        )
+
+    genres = sorted(set(_labeled_links(html, "Genre")))
+    actresses = sorted(set(_labeled_links(html, "Idol")))
+
+    return {
+        "Title": _clean_html_text(title.group(1)) if title else None,
+        "DVD ID": field("DVD ID", ("DVD ID", "DVD"), 4),
+        "Content ID": field("Content ID", ("Content ID",), 4),
+        "Release Date": field("Release Date", ("Released",), 4),
+        "Runtime": field("Runtime", ("Runtime",), 8),
+        "Studio": field("Studio", ("Studio",), 8),
+        "Director": field("Director", ("Director",), 8),
+        "Series": field("Series", ("Series",), 8),
+        "Plot": _extract_about(html),
+        "Genre(s)": ", ".join(genres) if genres else None,
+        "Idol(s)/Actress(es)": ", ".join(actresses) if actresses else None,
+    }
+
+
+def fetch_movie_details(page_url: str):
+    """Fetch a movie once and parse all metadata and artwork."""
+    html = _fetch_html(page_url)
+    if html is None:
+        return {}, None, []
+    return (
+        parse_movie_metadata(html),
+        parse_poster_url(html),
+        parse_preview_images(html),
+    )
+
+
+# Keep the original helpers available for small scripts using this module.
+def fetch_preview_images(page_url: str):
+    html = _fetch_html(page_url)
+    return parse_preview_images(html) if html is not None else []
+
+
+def fetch_poster_url(page_url: str) -> Optional[str]:
+    html = _fetch_html(page_url)
+    return parse_poster_url(html) if html is not None else None
+
+
+def fetch_movie_metadata(page_url: str):
+    html = _fetch_html(page_url)
+    return parse_movie_metadata(html) if html is not None else {}
+
+
+def safe_filename(name: str) -> str:
+    """Create a short filename valid on common operating systems."""
+    name = re.sub(r'[\x00-\x1f\\/:*?"<>|]+', "-", name.strip())
+    return re.sub(r"\s+", "_", name).strip("._-")[:200]
+
+
+def _select_nfo_basename(folder, dvd_id: Optional[str] = None) -> Optional[str]:
+    """Prefer a matching video filename for the NFO filename."""
+    try:
+        files = sorted(
+            (
+                item
+                for item in Path(folder).iterdir()
+                if item.is_file() and not item.name.startswith(".")
+            ),
+            key=lambda item: item.name.casefold(),
+        )
+    except FileNotFoundError:
         return None
 
-    meta["DVD ID"] = _labeled_single(html, "DVD ID") or extract(
-        ["DVD ID", "DVD"], max_words=4
-    )
-    meta["Content ID"] = _labeled_single(html, "Content ID") or extract(
-        ["Content ID"], max_words=4
-    )
-    meta["Release Date"] = _labeled_single(html, "Release Date") or extract(
-        ["Released"],
-        max_words=4,
-    )
-    meta["Runtime"] = _labeled_single(html, "Runtime") or extract(
-        ["Runtime"], max_words=8
-    )
-    meta["Studio"] = _labeled_single(html, "Studio") or extract(["Studio"], max_words=8)
-    director = _labeled_single(html, "Director")
-    if director is None:
-        director = extract(["Director"], max_words=8)
-    elif not director:
-        director = None
-    meta["Director"] = director
-    meta["Series"] = _labeled_single(html, "Series") or extract(["Series"], max_words=8)
+    if dvd_id:
+        matches = [item for item in files if dvd_id.casefold() in item.name.casefold()]
+        if matches:
+            files = matches
 
-    meta["Plot"] = _extract_about(html)
-
-    genres = set(_labeled_links(html, "Genre"))
-    meta["Genre(s)"] = ", ".join(sorted(genres)) if genres else None
-
-    actresses = set(_labeled_links(html, "Idol"))
-    meta["Idol(s)/Actress(es)"] = ", ".join(sorted(actresses)) if actresses else None
-
-    return meta
+    videos = [item for item in files if item.suffix.lower() in VIDEO_EXTENSIONS]
+    if videos:
+        return videos[0].stem
+    if dvd_id or not files:
+        return None
+    return files[0].stem
 
 
-def main():
-    p = argparse.ArgumentParser(
-        description="Search javdatabase.com and export metadata as Kodi NFO or JSON",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  javdb                      # interactive search + NFO to stdout\n"
-            "  javdb -q SONE-763          # non-interactive search by ID\n"
-            "  javdb -q SONE-763 -o out.nfo\n"
-            "  javdb -q SONE-763 --json -o metadata.json\n"
-            "  javdb --link https://www.javdatabase.com/movies/sone-763/ --download\n"
-        ),
-    )
-    p.add_argument(
-        "-q",
-        "--query",
-        help="Search query (e.g. movie ID like SONE-763 or a text phrase)",
-    )
-    p.add_argument(
-        "-l",
-        "--link",
-        help="Direct movie page URL on javdatabase.com (skips search)",
-    )
-    p.add_argument(
-        "-o",
-        "--output",
-        help="Output file path (NFO/XML by default, or JSON when --json is used)",
-    )
-    p.add_argument(
-        "-d",
-        "--download",
-        action="store_true",
-        help="Download poster + previews into a folder named after the DVD ID",
-    )
-    p.add_argument(
-        "--json",
-        action="store_true",
-        help="Output metadata as JSON instead of NFO/XML",
-    )
+def _split_values(value: Optional[str], ignored=()):
+    if not value:
+        return []
 
-    args = p.parse_args()
-    output_path = args.output
+    ignored_names = {name.casefold() for name in ignored}
+    values = []
+    for item in re.split(r"[,|/;]+", value):
+        item = item.strip()
+        if item and item.casefold() not in ignored_names:
+            values.append(item)
+    return values
 
-    # Search or direct link
-    if args.link:
-        selected = {"link": args.link, "title": None}
-    else:
-        query = args.query or input("Enter your search query: ").strip()
-        items = fetch_search(query)
-        if not items:
-            print("No results.")
-            return
 
-        if len(items) == 1:
-            selected = items[0]
-        else:
-            for i, it in enumerate(items, 1):
-                print(f"{i}) {it['code']} — {it['title']}")
-            while True:
-                c = input("Choose number: ").strip()
-                if c.isdigit() and 1 <= int(c) <= len(items):
-                    selected = items[int(c) - 1]
-                    break
+def _url_filename(url: str, fallback: str) -> str:
+    name = unquote(Path(urlparse(url).path).name)
+    return safe_filename(name) or fallback
 
-    # Collect metadata and images
-    metadata = fetch_movie_metadata(selected["link"])
-    postersrc = fetch_poster_url(selected["link"])
-    previews = fetch_preview_images(selected["link"])
 
-    # Normalize lists used by both JSON and NFO
-    genres_list = []
-    if metadata.get("Genre(s)"):
-        for g in re.split(r"[,|/;]+", metadata["Genre(s)"]):
-            g = g.strip()
-            if not g:
-                continue
-            if re.fullmatch(r"genres?|genre\(s\)?", g, flags=re.I):
-                continue
-            genres_list.append(g)
+def _download_file(url: str, destination: Path, label: str) -> bool:
+    try:
+        response = niquests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
 
-    actresses_list = []
-    if metadata.get("Idol(s)/Actress(es)"):
-        for act in re.split(r"[,|/;]+", metadata["Idol(s)/Actress(es)"]):
-            act = act.strip()
-            if act:
-                actresses_list.append(act)
+        with destination.open("wb") as output:
+            for chunk in response.iter_content(8192):
+                if chunk:
+                    output.write(chunk)
 
-    # JSON representation
-    json_obj = {
+        print(f"{label} downloaded -> {destination}")
+        return True
+    except Exception as error:
+        print(f"{label} download failed: {error}", file=sys.stderr)
+        return False
+
+
+def _prepare_download_folder(metadata, title: str):
+    """Choose the movie folder and default NFO basename."""
+    folder_name = metadata.get("DVD ID") or title or "movie"
+    safe_name = safe_filename(folder_name) or "movie"
+    dvd_id = metadata.get("DVD ID")
+
+    current_folder = Path.cwd()
+    existing_base = _select_nfo_basename(current_folder, dvd_id)
+    if existing_base:
+        return current_folder, existing_base
+
+    folder = Path(safe_name)
+    folder.mkdir(parents=True, exist_ok=True)
+    default_base = _select_nfo_basename(folder, dvd_id) or safe_name
+    return folder, default_base
+
+
+def _download_artwork(folder: Path, poster_url: Optional[str], previews):
+    preview_folder = folder / "preview"
+    preview_folder.mkdir(parents=True, exist_ok=True)
+    (preview_folder / ".ignore").touch(exist_ok=True)
+
+    if poster_url:
+        poster_name = _url_filename(poster_url, "poster.jpg")
+        _download_file(poster_url, preview_folder / poster_name, "Poster")
+
+    local_fanart = []
+    for number, image in enumerate(previews, start=1):
+        url = image.get("full") or image.get("preview")
+        if not url:
+            continue
+
+        filename = _url_filename(url, f"preview-{number}.jpg")
+        if _download_file(url, preview_folder / filename, "Preview"):
+            local_fanart.append(f"preview/{filename}")
+    return local_fanart
+
+
+def _build_json(selected, metadata, genres, actresses, previews, poster_url):
+    preview_urls = []
+    for image in previews:
+        url = image.get("full") or image.get("preview")
+        if url:
+            preview_urls.append(url)
+
+    return {
         "link": selected["link"],
         "title": metadata.get("Title") or selected.get("title"),
         "jav_series": metadata.get("Series"),
@@ -433,207 +408,168 @@ def main():
         "runtime": metadata.get("Runtime"),
         "studio": metadata.get("Studio"),
         "director": metadata.get("Director"),
-        "genres": genres_list,
-        "actresses": actresses_list,
-        "preview_images": [
-            img.get("full") or img.get("preview")
-            for img in previews
-            if img.get("full") or img.get("preview")
-        ],
-        "poster": postersrc,
+        "genres": genres,
+        "actresses": actresses,
+        "preview_images": preview_urls,
+        "poster": poster_url,
     }
 
-    # If JSON is requested, output JSON and skip NFO/XML
-    if args.json:
-        json_str = json.dumps(json_obj, ensure_ascii=False, indent=2)
-        print(json_str)
 
-        if args.download:
-            # With --download and JSON, default to metadata.json in the movie folder
-            folder_name = metadata.get("DVD ID") or json_obj["title"] or "movie"
-            folder = safe_filename(folder_name)
-            os.makedirs(folder, exist_ok=True)
-            if not output_path:
-                output_path = os.path.join(folder, "metadata.json")
+def _add_text(parent, name: str, value: Optional[str]):
+    if value:
+        child = SubElement(parent, name)
+        child.text = value
 
-        if output_path:
-            try:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(json_str)
-                print("JSON written ->", output_path, file=sys.stderr)
-            except Exception as e:
-                print("Failed saving JSON:", e, file=sys.stderr)
 
-        return
-
-    # Prepare XML (NFO)
-    import xml.dom.minidom as md
-    from xml.etree.ElementTree import Element, SubElement, tostring
-
-    def tag(parent, name, val):
-        if val:
-            e = SubElement(parent, name)
-            e.text = val
-            return e
-
+def _build_nfo(metadata, title, genres, actresses, poster_url, local_fanart) -> str:
     movie = Element("movie")
-
-    title = metadata.get("Title") or selected.get("title")
     release_date = metadata.get("Release Date")
-    year = (
-        release_date[:4] if release_date and re.match(r"\d{4}", release_date) else None
-    )
+    year = release_date[:4] if release_date and release_date[:4].isdigit() else None
 
-    tag(movie, "title", title)
-    tag(movie, "originaltitle", title)
-    tag(movie, "sorttitle", title)
-    tag(movie, "localtitle", title)
-    tag(movie, "year", year)
-    tag(movie, "releasedate", release_date)
+    for tag_name in ("title", "originaltitle", "sorttitle", "localtitle"):
+        _add_text(movie, tag_name, title)
 
-    runtime = None
-    if metadata.get("Runtime"):
-        m = re.search(r"(\d+)", metadata["Runtime"])
-        runtime = m.group(1) if m else None
-    tag(movie, "runtime", runtime)
+    _add_text(movie, "year", year)
+    _add_text(movie, "releasedate", release_date)
 
-    plot = metadata.get("Plot")
-    tag(movie, "plot", plot)
-    tag(movie, "review", "")
-    tag(movie, "biography", "")
+    runtime = re.search(r"\d+", metadata.get("Runtime") or "")
+    _add_text(movie, "runtime", runtime.group(0) if runtime else None)
+    _add_text(movie, "plot", metadata.get("Plot"))
+    _add_text(movie, "studio", metadata.get("Studio"))
+    _add_text(movie, "director", metadata.get("Director"))
+    _add_text(movie, "set", metadata.get("Series"))
 
-    # Studios
-    if metadata.get("Studio"):
-        tag(movie, "studio", metadata["Studio"])
+    for genre in genres:
+        _add_text(movie, "genre", genre)
 
-    tag(movie, "director", metadata.get("Director"))
+    for actress in actresses:
+        actor = SubElement(movie, "actor")
+        _add_text(actor, "name", actress)
 
-    # Series (optional)
-    if metadata.get("Series"):
-        tag(movie, "set", metadata["Series"])
+    for id_type, value in (
+        ("dvdid", metadata.get("DVD ID")),
+        ("contentid", metadata.get("Content ID")),
+    ):
+        if value:
+            unique_id = SubElement(movie, "uniqueid", {"type": id_type})
+            unique_id.text = value
 
-    # Genres
-    for g in genres_list:
-        tag(movie, "genre", g)
+    _add_text(movie, "thumb", poster_url)
 
-    # Actors
-    for act in actresses_list:
-        ae = SubElement(movie, "actor")
-        tag(ae, "name", act)
-        tag(ae, "role", "")
+    if local_fanart:
+        fanart = SubElement(movie, "fanart")
+        for filename in local_fanart:
+            _add_text(fanart, "thumb", filename)
 
-    # Unique IDs
-    if metadata.get("DVD ID"):
-        u = SubElement(movie, "uniqueid")
-        u.set("type", "dvdid")
-        u.text = metadata["DVD ID"]
-
-    if metadata.get("Content ID"):
-        u = SubElement(movie, "uniqueid")
-        u.set("type", "contentid")
-        u.text = metadata["Content ID"]
-
-    # ----------------------------------------------------------------------
-    # DOWNLOAD SECTION (local images + relative paths)
-    # ----------------------------------------------------------------------
-    poster_filename = None
-    local_fanarts = []
-
-    if args.download:
-        folder_name = metadata.get("DVD ID") or title or "movie"
-        dvd_id = metadata.get("DVD ID")
-        cwd = os.getcwd()
-        base_in_cwd = _select_nfo_basename(cwd, dvd_id=dvd_id)
-        if base_in_cwd:
-            folder = cwd
-            default_base = base_in_cwd
-        else:
-            folder = safe_filename(folder_name)
-            os.makedirs(folder, exist_ok=True)
-            default_base = _select_nfo_basename(folder, dvd_id=dvd_id) or safe_filename(
-                folder_name
-            )
-
-        preview_folder = os.path.join(folder, "preview")
-        os.makedirs(preview_folder, exist_ok=True)
-
-        open(os.path.join(folder, "preview", ".ignore"), "a").close()
-
-        # ---- Download poster -> MOVIE_FOLDER ----
-        if postersrc:
-            parsed = urlparse(postersrc)
-            poster_filename = unquote(parsed.path.split("/")[-1])
-            poster_path = os.path.join(folder, "preview", poster_filename)
-
-            try:
-                r = niquests.get(postersrc, stream=True, timeout=20)
-                r.raise_for_status()
-                with open(os.path.join(poster_path), "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
-                print(f"Poster downloaded -> {poster_path}")
-            except Exception as e:
-                print("Poster download failed:", e)
-                poster_filename = None
-
-        # ---- Download previews -> MOVIE_FOLDER/preview ----
-        for img in previews:
-            url = img.get("full") or img.get("preview")
-            if not url:
-                continue
-            parsed = urlparse(url)
-            fname = unquote(parsed.path.split("/")[-1])
-            dest = os.path.join(preview_folder, fname)
-            try:
-                r = niquests.get(url, stream=True, timeout=20)
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
-                local_fanarts.append(f"preview/{fname}")
-                print("Downloaded preview ->", dest)
-            except Exception as e:
-                print("Preview download failed:", e)
-
-        # If --download is enabled, ALWAYS write NFO inside movie folder by default
-        if not output_path:
-            output_path = os.path.join(folder, f"{default_base}.nfo")
-
-    # ----------------------------------------------------------------------
-    # Artwork references in NFO (using relative paths)
-    # ----------------------------------------------------------------------
-    if postersrc:
-        tag(movie, "thumb", postersrc)
-
-    if local_fanarts:
-        fan = SubElement(movie, "fanart")
-        for f in local_fanarts:
-            fe = SubElement(fan, "thumb")
-            fe.text = f
-
-    # ----------------------------------------------------------------------
-    # Final XML
-    # ----------------------------------------------------------------------
-    xml_str = (
-        md.parseString(tostring(movie, encoding="utf-8"))
+    raw_xml = tostring(movie, encoding="utf-8")
+    return (
+        minidom.parseString(raw_xml)
         .toprettyxml(indent="  ", encoding="utf-8")
         .decode("utf-8")
     )
 
-    print(xml_str)
 
-    # Save NFO (if output path defined or forced by download)
-    output_path = output_path or args.output
-    if output_path:
-        try:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(xml_str)
-            print("NFO written ->", output_path)
-        except Exception as e:
-            print("Failed saving NFO:", e)
+def _write_text(path, contents: str, label: str):
+    try:
+        Path(path).write_text(contents, encoding="utf-8")
+        print(f"{label} written -> {path}", file=sys.stderr)
+    except OSError as error:
+        print(f"Failed saving {label}: {error}", file=sys.stderr)
+
+
+def _select_movie(query: Optional[str], direct_link: Optional[str]):
+    if direct_link:
+        return {"link": direct_link, "title": None}
+
+    query = query or input("Enter your search query: ").strip()
+    results = fetch_search(query)
+
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+
+    for number, result in enumerate(results, start=1):
+        print(f"{number}) {result['code']} — {result['title']}")
+
+    while True:
+        choice = input("Choose number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(results):
+            return results[int(choice) - 1]
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Search JAVDatabase and export metadata as Kodi NFO or JSON.",
+        epilog=(
+            "Examples:\n"
+            "  javdb\n"
+            "  javdb -q SONE-763 -o movie.nfo\n"
+            "  javdb -q SONE-763 --json -o metadata.json\n"
+            "  javdb -l https://www.javdatabase.com/movies/sone-763/ -d"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-q", "--query", help="Movie ID or search text")
+    parser.add_argument("-l", "--link", help="Direct JAVDatabase movie URL")
+    parser.add_argument("-o", "--output", help="Output file path")
+    parser.add_argument(
+        "-d", "--download", action="store_true", help="Download poster and previews"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Output JSON instead of NFO"
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = _parse_args()
+
+    try:
+        selected = _select_movie(args.query, args.link)
+    except Exception as error:
+        print(f"Search failed: {error}", file=sys.stderr)
+        return 1
+
+    if not selected:
+        print("No results.")
+        return 0
+
+    # One request supplies every parser instead of downloading the page three times.
+    metadata, poster_url, previews = fetch_movie_details(selected["link"])
+    title = metadata.get("Title") or selected.get("title") or "movie"
+    genres = _split_values(metadata.get("Genre(s)"), ("genre", "genres", "genre(s)"))
+    actresses = _split_values(metadata.get("Idol(s)/Actress(es)"))
+
+    folder = None
+    default_nfo_base = None
+    local_fanart = []
+
+    if args.download:
+        folder, default_nfo_base = _prepare_download_folder(metadata, title)
+        local_fanart = _download_artwork(folder, poster_url, previews)
+
+    if args.json:
+        document = json.dumps(
+            _build_json(selected, metadata, genres, actresses, previews, poster_url),
+            ensure_ascii=False,
+            indent=2,
+        )
+        print(document)
+
+        output = args.output or (folder / "metadata.json" if folder else None)
+        if output:
+            _write_text(output, document, "JSON")
+        return 0
+
+    document = _build_nfo(metadata, title, genres, actresses, poster_url, local_fanart)
+    print(document)
+
+    output = args.output or (folder / f"{default_nfo_base}.nfo" if folder else None)
+    if output:
+        _write_text(output, document, "NFO")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
