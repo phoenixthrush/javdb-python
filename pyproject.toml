@@ -1,10 +1,8 @@
 [project]
 name = "javdb"
-version = "0.1.3"
-dependencies = [
-  "niquests",
-]
-requires-python = ">=3.7"
+version = "0.2.0"
+dependencies = []
+requires-python = ">=3.11"
 authors = [
   { name="Phoenixthrush UwU", email="contact@phoenixthrush.com" },
 ]
@@ -32,4 +30,4 @@ Changelog = "https://github.com/phoenixthrush/javdb-python/commits"
 Funding = "https://github.com/sponsors/phoenixthrush"
 
 [project.scripts]
-javdb = "javdb.__main__:main"
+javdb = "javdb.cli:main"
